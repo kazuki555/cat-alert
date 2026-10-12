@@ -124,6 +124,7 @@
   label.check input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
   .help { color: var(--muted); font-size: .85rem; margin: 6px 0 0; }
   .help-list { margin: 0; padding-left: 1.3em; font-size: .92rem; }
+  .version { text-align: center; margin-top: 16px; }
 
   .log { list-style: none; margin: 0; padding: 0; max-height: 380px; overflow-y: auto; }
   .log li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 10px; padding: 8px 0; border-top: 1px solid var(--border); font-size: .9rem; }
@@ -324,8 +325,10 @@
       <li>「見張りを始める」を押します。見張り中は画面を消さず、Safariを開いたままにしてください。</li>
       <li>「省電力表示」で画面を黒くできます（すばやく2回タップで戻ります）。</li>
       <li>見つけている間は自動で録画し、「録画」欄に保存します（このiPhoneの中だけ）。「保存・共有」から写真アプリへの保存やAirDropができます。</li>
+      <li>通知は1回来るたびに1回です。「判定」欄が「いない」に戻ってから再び現れると、また通知します。</li>
     </ol>
   </details>
+  <p class="help version">猫アラート 試作版 v2</p>
 </div>
 
 <div id="dim" class="dim" hidden>
@@ -541,10 +544,25 @@ const stats = { inferMs: null, rate: null, lastDetectAt: null, net: 'idle', fail
 
 function resetTrackers() { for (const k of Object.keys(trackers)) delete trackers[k]; }
 
+// 「判定」欄の文。次の通知がいつ届くかが分かるように、残り時間も出す
+function judgeText(label, now) {
+  const t = trackers[label];
+  const name = TARGETS[label].label;
+  if (!t) return `${name}：いない`;
+  if (t.present) {
+    const gone = now - t.lastSeen;
+    if (gone < 2000) return `${name}：来ている`;
+    const left = Math.max(0, Math.ceil((settings.absentSec * 1000 - gone) / 1000));
+    return `${name}：見えなくなって${Math.floor(gone / 1000)}秒（あと${left}秒で「いない」に戻ります）`;
+  }
+  const wait = t.lastNotified ? Math.ceil((settings.minIntervalSec * 1000 - (now - t.lastNotified)) / 1000) : 0;
+  return wait > 0 ? `${name}：いない（次に通知できるまで あと${wait}秒）` : `${name}：いない`;
+}
+
 function updateStatus() {
   els.stState.textContent = mode === 'camera' && running ? '見張り中' : mode === 'test' ? 'テスト中' : '待機中';
-  els.stJudge.textContent = settings.targets
-    .map((t) => `${TARGETS[t].label}：${trackers[t]?.present ? '来ている' : 'いない'}`).join(' / ');
+  const now = Date.now();
+  els.stJudge.textContent = settings.targets.map((t) => judgeText(t, now)).join(' / ');
   els.stRate.textContent = stats.rate == null ? '—' : `${stats.rate.toFixed(1)}回/秒・1回 ${Math.round(stats.inferMs)}ms`;
   els.stLast.textContent = stats.lastDetectAt ? fmtTime(stats.lastDetectAt) : '—';
   els.stCount.textContent = `${dailyCount()}件（上限 ${DAILY_CAP}件）`;
@@ -716,13 +734,9 @@ async function processFrame() {
 // ---------- 「来た／いない」の判定 ----------
 async function updateTrackers(dets, src) {
   const now = Date.now();
-  // 録画を続けるかどうかは少し甘めの基準で見る（体の一部しか映っていないときに途切れないように）
-  const glimpseMin = Math.max(DETECT_FLOOR, settings.threshold - 0.2);
   for (const label of settings.targets) {
-    const t = trackers[label] ??= { hist: [], present: false, lastSeen: 0, lastGlimpse: 0, lastNotified: 0 };
-    const mine = dets.filter((d) => d.label === label);
-    const hits = mine.filter((d) => d.score >= settings.threshold);
-    if (mine.some((d) => d.score >= glimpseMin)) t.lastGlimpse = now;
+    const t = trackers[label] ??= { hist: [], present: false, lastSeen: 0, lastNotified: 0 };
+    const hits = dets.filter((d) => d.label === label && d.score >= settings.threshold);
     t.hist.push(hits.length > 0);
     if (t.hist.length > CONFIRM_N) t.hist.shift();
     if (hits.length) t.lastSeen = now;
@@ -1022,8 +1036,9 @@ function stopRecording() {
 }
 function checkRecordingEnd(now) {
   if (!rec) return;
-  const lastGlimpse = Math.max(0, ...settings.targets.map((l) => trackers[l]?.lastGlimpse || 0));
-  if (now - lastGlimpse >= settings.recGraceSec * 1000) {
+  // 通知と同じ基準（判定の厳しさ）で見つからなくなってから、決めた秒数がたったら止める
+  const lastSeen = Math.max(0, ...settings.targets.map((l) => trackers[l]?.lastSeen || 0));
+  if (now - lastSeen >= settings.recGraceSec * 1000) {
     stopRecording();
   } else if (now - rec.startedAt >= REC_MAX_MS) {
     // 長くなったら区切って、続きを新しいファイルに録る
