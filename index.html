@@ -238,6 +238,13 @@
           <option value="5">5回</option>
         </select>
       </label>
+      <label>明るさ補正
+        <select id="boost">
+          <option value="auto">自動（暗いときだけ明るくする）</option>
+          <option value="high">強（もっと明るくする）</option>
+          <option value="off">なし</option>
+        </select>
+      </label>
       <label>「いなくなった」とみなすまで
         <select id="absentSec">
           <option value="30">30秒</option>
@@ -328,7 +335,7 @@
       <li>通知は1回来るたびに1回です。「判定」欄が「いない」に戻ってから再び現れると、また通知します。</li>
     </ol>
   </details>
-  <p class="help version">猫アラート 試作版 v2</p>
+  <p class="help version">猫アラート 試作版 v3</p>
 </div>
 
 <div id="dim" class="dim" hidden>
@@ -408,6 +415,7 @@ const DEFAULTS = {
   sendInTest: false,
   record: true,
   recGraceSec: 5,
+  boost: 'auto',
 };
 const settings = { ...DEFAULTS, ...load('settings', {}) };
 settings.targets = (Array.isArray(settings.targets) ? settings.targets : []).filter((t) => t in TARGETS);
@@ -418,6 +426,7 @@ settings.fps = pick(settings.fps, [1, 2, 3, 5], DEFAULTS.fps);
 settings.absentSec = pick(settings.absentSec, [30, 60, 120, 300], DEFAULTS.absentSec);
 settings.minIntervalSec = pick(settings.minIntervalSec, [30, 60, 180, 600], DEFAULTS.minIntervalSec);
 settings.recGraceSec = pick(settings.recGraceSec, [3, 5, 10, 30], DEFAULTS.recGraceSec);
+settings.boost = pick(settings.boost, ['auto', 'high', 'off'], DEFAULTS.boost);
 if (!(settings.threshold >= 0.3 && settings.threshold <= 0.9)) settings.threshold = DEFAULTS.threshold;
 if (!isValidRoi(settings.roi)) settings.roi = { ...DEFAULTS.roi };
 if (!isValidTopic(settings.topic)) settings.topic = randomTopic();
@@ -462,7 +471,7 @@ const els = {
   startBtn: $('#startBtn'), stopBtn: $('#stopBtn'), testNotifyBtn: $('#testNotifyBtn'), dimBtn: $('#dimBtn'), flipBtn: $('#flipBtn'),
   stState: $('#stState'), stJudge: $('#stJudge'), stRate: $('#stRate'), stLast: $('#stLast'),
   stCount: $('#stCount'), stNet: $('#stNet'), stWake: $('#stWake'), stRec: $('#stRec'),
-  record: $('#record'), recGraceSec: $('#recGraceSec'), clips: $('#clips'), clipsInfo: $('#clipsInfo'), clipsClear: $('#clipsClear'),
+  boost: $('#boost'), record: $('#record'), recGraceSec: $('#recGraceSec'), clips: $('#clips'), clipsInfo: $('#clipsInfo'), clipsClear: $('#clipsClear'),
   settingsBox: $('#settingsBox'), topic: $('#topic'), topicCopy: $('#topicCopy'), topicShare: $('#topicShare'), topicNew: $('#topicNew'),
   targetBoxes: $$('input[name=target]'), threshold: $('#threshold'), thresholdVal: $('#thresholdVal'),
   model: $('#model'), fps: $('#fps'), absentSec: $('#absentSec'), minIntervalSec: $('#minIntervalSec'),
@@ -649,7 +658,47 @@ let loopTimer = null;
 let frameCount = 0;
 let rateStart = 0;
 const work = document.createElement('canvas');
-const wctx = work.getContext('2d');
+const wctx = work.getContext('2d', { willReadFrequently: true });
+
+// ---------- 明るさ補正（Safariのカメラは、標準カメラアプリのような自動の明るさ調整が効かないため） ----------
+// 画面全体の平均の明るさ（0〜255）が target になるように持ち上げる（明るい場所では何もしない）。max は持ち上げる倍率の上限
+const BOOST_LEVELS = { auto: { target: 110, max: 6 }, high: { target: 150, max: 10 } };
+let boostGain = 1;
+let lutKey = '';
+let lutData = null;
+function lutFor(gain) {
+  const key = gain.toFixed(2);
+  if (key !== lutKey) {
+    lutData = new Uint8ClampedArray(256);
+    for (let i = 0; i < 256; i++) lutData[i] = 255 * Math.pow(Math.min(1, (i * gain) / 255), 0.8);  // 暗い部分を特に持ち上げる
+    lutKey = key;
+  }
+  return lutData;
+}
+function applyLut(ctx, w, h, gain) {
+  if (gain < 1.05) return;
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const lut = lutFor(gain);
+  for (let i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
+  ctx.putImageData(img, 0, 0);
+}
+// 判定用の画像の明るさを測って補正量を決め、補正する
+function boostWork(w, h) {
+  if (settings.boost === 'off') { boostGain = 1; return; }
+  const lv = BOOST_LEVELS[settings.boost];
+  const d = wctx.getImageData(0, 0, w, h).data;
+  let sum = 0;
+  let n = 0;
+  for (let i = 0; i < d.length; i += 16) { sum += d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114; n++; }
+  const want = clamp(lv.target / Math.max(sum / n, 4), 1, lv.max);
+  boostGain = boostGain * 0.7 + want * 0.3;   // 急に変わらないようにならす
+  applyLut(wctx, w, h, boostGain);
+}
+function setPreviewFilter() {
+  const f = boostGain >= 1.05 ? `brightness(${boostGain.toFixed(2)})` : '';
+  for (const el of [els.cam, els.testImg, els.testVid]) if (el.style.filter !== f) el.style.filter = f;
+}
 
 function startLoop() {
   if (looping) return;
@@ -704,6 +753,8 @@ async function processFrame() {
   const wh = Math.max(1, Math.round(ch * k));
   if (work.width !== ww || work.height !== wh) { work.width = ww; work.height = wh; }
   wctx.drawImage(src, cx, cy, cw, ch, 0, 0, ww, wh);
+  boostWork(ww, wh);
+  setPreviewFilter();
 
   const t0 = performance.now();
   const result = detector.detect(work);
@@ -805,6 +856,7 @@ async function makeSnapshot(src, hits) {
   c.height = h;
   const g = c.getContext('2d');
   g.drawImage(src, 0, 0, w, h);
+  applyLut(g, w, h, boostGain);
   const lw = Math.max(2, Math.round(w / 220));
   const r = settings.roi;
   if (!isFullRoi(r)) {
@@ -974,22 +1026,26 @@ function startOrExtendRecording(label) {
   startRecording([label]);
 }
 function recordingStream() {
-  if (mode === 'camera') return stream;
-  if (mode !== 'test' || !HTMLCanvasElement.prototype.captureStream) return null;
+  const canCanvas = !!HTMLCanvasElement.prototype.captureStream;
+  // 明るさ補正がオンのカメラ映像は、補正したあとの映像をキャンバス経由で録画する（少し画質は下がる）
+  if (mode === 'camera' && !(settings.boost !== 'off' && canCanvas)) return stream;
+  if (!canCanvas || (mode !== 'test' && mode !== 'camera')) return null;
   const src = activeSource();
   if (!sourceReady(src)) return null;
   const [sw, sh] = sourceSize(src);
-  const k = Math.min(1, 1280 / sw);
+  const k = Math.min(1, (mode === 'camera' ? 960 : 1280) / sw);
   recCanvas = document.createElement('canvas');
   recCanvas.width = Math.round(sw * k);
   recCanvas.height = Math.round(sh * k);
-  recCtx = recCanvas.getContext('2d');
+  recCtx = recCanvas.getContext('2d', { willReadFrequently: true });
   drawRecCanvas();
-  return recCanvas.captureStream(10);
+  return recCanvas.captureStream(mode === 'camera' ? 15 : 10);
 }
 function drawRecCanvas() {
   const src = activeSource();
-  if (recCtx && sourceReady(src)) recCtx.drawImage(src, 0, 0, recCanvas.width, recCanvas.height);
+  if (!recCtx || !sourceReady(src)) return;
+  recCtx.drawImage(src, 0, 0, recCanvas.width, recCanvas.height);
+  applyLut(recCtx, recCanvas.width, recCanvas.height, boostGain);
 }
 function startRecording(labels) {
   if (rec) return;
@@ -1018,6 +1074,8 @@ function startRecording(labels) {
     return;
   }
   rec = r;
+  // カメラ映像をキャンバス経由で録画するときは、録画用の絵を1秒に約15回描き直す
+  if (mode === 'camera' && s !== stream) r.drawTimer = setInterval(drawRecCanvas, 1000 / 15);
   addLog(`録画を始めました（${targetNames(labels)}）`, 'info');
   updateStatus();
 }
@@ -1026,6 +1084,7 @@ function stopRecording() {
   if (!r) return;
   rec = null;
   r.endedAt = Date.now();
+  clearInterval(r.drawTimer);
   try {
     if (r.recorder.state !== 'inactive') r.recorder.stop();
     else finishRecording(r);
@@ -1050,6 +1109,7 @@ function checkRecordingEnd(now) {
 async function finishRecording(r) {
   if (r.finished) return;
   r.finished = true;
+  clearInterval(r.drawTimer);
   if (rec === r) rec = null;
   if (!r.endedAt) r.endedAt = Date.now();
   const type = r.recorder.mimeType || recMime || 'video/mp4';
@@ -1230,9 +1290,11 @@ async function startCamera() {
   stopCamera();
   const s = await navigator.mediaDevices.getUserMedia({
     audio: false,
-    video: { facingMode: { ideal: settings.facing }, width: { ideal: 1280 }, height: { ideal: 720 } },
+    // コマ数を15に抑えると、暗いときにシャッターを長く開けられて、少し明るく映る
+    video: { facingMode: { ideal: settings.facing }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 15 } },
   });
   stream = s;
+  tuneExposure(s);
   els.cam.srcObject = s;
   try { await els.cam.play(); } catch { /* autoplay 属性で再生される */ }
   lastFrameAt = performance.now();
@@ -1240,6 +1302,20 @@ async function startCamera() {
   s.getVideoTracks()[0]?.addEventListener('ended', () => {
     if (running && stream === s) scheduleCameraRestart('カメラが止まりました。再起動します');
   });
+}
+// カメラ本体の露出を明るめにする（端末やブラウザが対応している場合だけ。対応していなければ何もしない）
+async function tuneExposure(s) {
+  try {
+    const track = s.getVideoTracks()[0];
+    const caps = track && track.getCapabilities ? track.getCapabilities() : {};
+    const adv = {};
+    if (Array.isArray(caps.exposureMode) && caps.exposureMode.includes('continuous')) adv.exposureMode = 'continuous';
+    const ec = caps.exposureCompensation;
+    if (ec && Number.isFinite(ec.max) && ec.max > 0) adv.exposureCompensation = ec.max * 0.5;
+    if (!Object.keys(adv).length) return;
+    await track.applyConstraints({ advanced: [adv] });
+    if (!tuneExposure.logged) { tuneExposure.logged = true; addLog('カメラの露出を明るめにしました', 'info'); }
+  } catch { /* 対応していない */ }
 }
 function stopCamera() {
   if (rec && !rec.viaCanvas) stopRecording();  // カメラを止める前に、録画中の分を保存する
@@ -1401,6 +1477,8 @@ function stopMonitoring() {
   mode = 'idle';
   lastDets = [];
   resetTrackers();
+  boostGain = 1;
+  setPreviewFilter();
   showSource();
   setBadge('待機中');
   showStageMsg(IDLE_MSG);
@@ -1462,6 +1540,8 @@ function endTest() {
   mode = 'idle';
   lastDets = [];
   resetTrackers();
+  boostGain = 1;
+  setPreviewFilter();
   els.fileInput.value = '';
   els.testEnd.hidden = true;
   showSource();
@@ -1666,6 +1746,7 @@ function renderSettings() {
   els.sendInTest.checked = settings.sendInTest;
   els.record.checked = settings.record;
   els.recGraceSec.value = String(settings.recGraceSec);
+  els.boost.value = settings.boost;
   renderRoiText();
 }
 els.topic.addEventListener('change', () => {
@@ -1727,6 +1808,12 @@ els.model.addEventListener('change', () => {
 for (const key of ['fps', 'absentSec', 'minIntervalSec', 'recGraceSec']) {
   els[key].addEventListener('change', () => { settings[key] = Number(els[key].value); saveSettings(); });
 }
+els.boost.addEventListener('change', () => {
+  settings.boost = els.boost.value;
+  saveSettings();
+  if (settings.boost === 'off') { boostGain = 1; setPreviewFilter(); }
+  addLog(`明るさ補正：${els.boost.selectedOptions[0].textContent}`, 'info');
+});
 els.record.addEventListener('change', () => {
   settings.record = els.record.checked;
   saveSettings();
