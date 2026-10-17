@@ -253,6 +253,14 @@
           <option value="300">5分</option>
         </select>
       </label>
+      <label>映り続けているときの通知
+        <select id="repeatSec">
+          <option value="60">1分ごと</option>
+          <option value="180">3分ごと</option>
+          <option value="600">10分ごと</option>
+          <option value="0">しない（来たときの1回だけ）</option>
+        </select>
+      </label>
       <label>同じ対象の通知の最短間隔
         <select id="minIntervalSec">
           <option value="30">30秒</option>
@@ -335,7 +343,7 @@
       <li>通知は1回来るたびに1回です。「判定」欄が「いない」に戻ってから再び現れると、また通知します。</li>
     </ol>
   </details>
-  <p class="help version">猫アラート 試作版 v3</p>
+  <p class="help version">猫アラート 試作版 v4</p>
 </div>
 
 <div id="dim" class="dim" hidden>
@@ -369,6 +377,8 @@ const DETECT_FLOOR = 0.25;    // これ未満の候補はAIから受け取らな
 const WORK_MAX = 640;         // 判定用に縮小するときの最大辺
 const SNAPSHOT_WIDTH = 640;
 const DAILY_CAP = 200;        // ntfy.sh 無料枠（1日250通）より少なく
+const REMIND_RESERVE = 30;    // 1日の残りがこれ未満になったら、「映り続けている」通知は止める（新しく来たときの通知に残しておく）
+const REMIND_PHOTO_WIDTH = 480;  // 「映り続けている」通知の写真は小さくする（無料枠の添付の合計20MBを使い切らないため）
 const RETRY_MS = 10_000;
 const RATE_LIMIT_RETRY_MS = 60_000;
 const SYSTEM_GAP_MS = 5 * 60_000;  // 開始・再開の通知は5分に1回まで
@@ -409,6 +419,7 @@ const DEFAULTS = {
   fps: 3,
   absentSec: 60,
   minIntervalSec: 60,
+  repeatSec: 60,
   roi: { x: 0, y: 0, w: 1, h: 1 },
   facing: 'environment',
   gpu: false,
@@ -425,6 +436,7 @@ const pick = (v, allowed, def) => (allowed.includes(v) ? v : def);
 settings.fps = pick(settings.fps, [1, 2, 3, 5], DEFAULTS.fps);
 settings.absentSec = pick(settings.absentSec, [30, 60, 120, 300], DEFAULTS.absentSec);
 settings.minIntervalSec = pick(settings.minIntervalSec, [30, 60, 180, 600], DEFAULTS.minIntervalSec);
+settings.repeatSec = pick(settings.repeatSec, [0, 60, 180, 600], DEFAULTS.repeatSec);
 settings.recGraceSec = pick(settings.recGraceSec, [3, 5, 10, 30], DEFAULTS.recGraceSec);
 settings.boost = pick(settings.boost, ['auto', 'high', 'off'], DEFAULTS.boost);
 if (!(settings.threshold >= 0.3 && settings.threshold <= 0.9)) settings.threshold = DEFAULTS.threshold;
@@ -474,7 +486,7 @@ const els = {
   boost: $('#boost'), record: $('#record'), recGraceSec: $('#recGraceSec'), clips: $('#clips'), clipsInfo: $('#clipsInfo'), clipsClear: $('#clipsClear'),
   settingsBox: $('#settingsBox'), topic: $('#topic'), topicCopy: $('#topicCopy'), topicShare: $('#topicShare'), topicNew: $('#topicNew'),
   targetBoxes: $$('input[name=target]'), threshold: $('#threshold'), thresholdVal: $('#thresholdVal'),
-  model: $('#model'), fps: $('#fps'), absentSec: $('#absentSec'), minIntervalSec: $('#minIntervalSec'),
+  model: $('#model'), fps: $('#fps'), absentSec: $('#absentSec'), minIntervalSec: $('#minIntervalSec'), repeatSec: $('#repeatSec'),
   roiEdit: $('#roiEdit'), roiReset: $('#roiReset'), roiText: $('#roiText'), gpu: $('#gpu'), server: $('#server'),
   fileInput: $('#fileInput'), sendInTest: $('#sendInTest'), testEnd: $('#testEnd'),
   log: $('#log'), dim: $('#dim'), dimInfo: $('#dimInfo'), dimState: $('#dimState'), dimSub: $('#dimSub'),
@@ -560,7 +572,10 @@ function judgeText(label, now) {
   if (!t) return `${name}：いない`;
   if (t.present) {
     const gone = now - t.lastSeen;
-    if (gone < 2000) return `${name}：来ている`;
+    if (gone < 2000) {
+      const next = settings.repeatSec && t.nextRemindAt ? Math.max(0, Math.ceil((t.nextRemindAt - now) / 1000)) : 0;
+      return next > 0 ? `${name}：来ている（次の通知まで あと${next}秒）` : `${name}：来ている`;
+    }
     const left = Math.max(0, Math.ceil((settings.absentSec * 1000 - gone) / 1000));
     return `${name}：見えなくなって${Math.floor(gone / 1000)}秒（あと${left}秒で「いない」に戻ります）`;
   }
@@ -795,11 +810,17 @@ async function updateTrackers(dets, src) {
     if (confirmed) startOrExtendRecording(label);
     if (!t.present && confirmed) {
       t.present = true;
+      t.presentSince = now;
+      t.nextRemindAt = settings.repeatSec ? now + settings.repeatSec * 1000 : 0;
       await onArrival(label, hits, src, t, now);
     } else if (t.present && now - t.lastSeen >= settings.absentSec * 1000) {
       t.present = false;
       t.hist = [];
       addLog(`${TARGETS[label].label}がいなくなりました`, 'info');
+    } else if (t.present && confirmed && settings.repeatSec && now >= (t.nextRemindAt || 0)) {
+      // 映り続けているあいだ、決めた間隔でもう一度知らせる
+      t.nextRemindAt = now + settings.repeatSec * 1000;
+      await onStillThere(label, hits, src, t, now);
     }
   }
   checkRecordingEnd(now);
@@ -845,10 +866,47 @@ async function onArrival(label, hits, src, t, now) {
   });
 }
 
+// 映り続けているときの通知（写真は小さめ）
+async function onStillThere(label, hits, src, t, now) {
+  const name = TARGETS[label].label;
+  const pct = Math.round(Math.max(...hits.map((h) => h.score)) * 100);
+  const lasted = fmtDuration(now - t.presentSince);
+  stats.lastDetectAt = now;
+  if (mode === 'test' && !settings.sendInTest) {
+    addLog(`${name}がまだ映っています（${lasted}）。テスト中なので通知は送りません`, 'detect');
+    return;
+  }
+  if (dailyCount() >= DAILY_CAP - REMIND_RESERVE) {
+    if (!t.capLogged) {
+      t.capLogged = true;
+      addLog('今日の通知が多いので、映り続けているあいだの通知はここで止めます（新しく来たときだけ通知します）', 'warn');
+    }
+    return;
+  }
+  let blob = null;
+  let thumb = null;
+  try {
+    blob = await makeSnapshot(src, hits, REMIND_PHOTO_WIDTH);
+    thumb = URL.createObjectURL(blob);
+  } catch (e) {
+    console.warn(e);
+  }
+  t.lastNotified = now;
+  addLog(`${name}がまだ映っています（${lasted}）。通知を送ります`, 'detect', thumb);
+  enqueue({
+    title: `${name}がまだいます`,
+    message: `${fmtTime(now)}：${name}が映り続けています（${lasted}・確からしさ ${pct}%）${rec ? '。カメラ側で録画しています' : ''}`,
+    tags: TARGETS[label].tag,
+    priority: 4,
+    blob,
+    filename: `${label}-${stamp(now)}.jpg`,
+  });
+}
+
 // ---------- 通知用の写真 ----------
-async function makeSnapshot(src, hits) {
+async function makeSnapshot(src, hits, width = SNAPSHOT_WIDTH) {
   const [sw, sh] = sourceSize(src);
-  const k = Math.min(1, SNAPSHOT_WIDTH / sw);
+  const k = Math.min(1, width / sw);
   const w = Math.round(sw * k);
   const h = Math.round(sh * k);
   const c = document.createElement('canvas');
@@ -968,6 +1026,12 @@ async function flushQueue() {
         await sendNtfy(m);
       } catch (e) {
         if (e.status >= 400 && e.status < 500 && e.status !== 429) {
+          if (m.blob) {
+            // 写真が大きすぎるなどで断られたときは、写真なしの文字だけで送り直す
+            m.blob = null;
+            addLog(`写真つきで送れなかったので（${errText(e)}）、文字だけで送り直します`, 'warn');
+            continue;
+          }
           queue.shift();
           addLog(`通知を送れませんでした（${errText(e)}）。この通知は取り消しました`, 'error');
           continue;
@@ -1741,6 +1805,7 @@ function renderSettings() {
   els.fps.value = String(settings.fps);
   els.absentSec.value = String(settings.absentSec);
   els.minIntervalSec.value = String(settings.minIntervalSec);
+  els.repeatSec.value = String(settings.repeatSec);
   els.gpu.checked = settings.gpu;
   els.server.value = settings.server;
   els.sendInTest.checked = settings.sendInTest;
@@ -1805,7 +1870,7 @@ els.model.addEventListener('change', () => {
   saveSettings();
   addLog(`AIモデルを「${els.model.selectedOptions[0].textContent}」にしました`, 'info');
 });
-for (const key of ['fps', 'absentSec', 'minIntervalSec', 'recGraceSec']) {
+for (const key of ['fps', 'absentSec', 'minIntervalSec', 'recGraceSec', 'repeatSec']) {
   els[key].addEventListener('change', () => { settings[key] = Number(els[key].value); saveSettings(); });
 }
 els.boost.addEventListener('change', () => {
