@@ -68,6 +68,7 @@ const DEFAULTS = {
   recGraceSec: 5,
   boost: 'auto',
   torch: false,
+  view: 'normal',
 };
 const settings = { ...DEFAULTS, ...load('settings', {}) };
 // v5：対象を「猫・犬・人」から「動物・人」に置きかえる（1回だけ。cat／dog があれば animal にする）
@@ -90,6 +91,7 @@ settings.repeatSec = pick(settings.repeatSec, [0, 60, 180, 600], DEFAULTS.repeat
 settings.recGraceSec = pick(settings.recGraceSec, [3, 5, 10, 30], DEFAULTS.recGraceSec);
 settings.boost = pick(settings.boost, ['auto', 'high', 'off'], DEFAULTS.boost);
 settings.torch = settings.torch === true;
+settings.view = pick(settings.view, ['normal', 'ultra', 'hd'], DEFAULTS.view);
 if (!(settings.threshold >= 0.3 && settings.threshold <= 0.9)) settings.threshold = DEFAULTS.threshold;
 if (!isValidRoi(settings.roi)) settings.roi = { ...DEFAULTS.roi };
 if (!isValidTopic(settings.topic)) settings.topic = randomTopic();
@@ -109,7 +111,7 @@ function targetNames(list) { return list.filter((t) => t in GROUPS).map((t) => G
 const els = {
   badge: $('#badge'), stage: $('#stage'), cam: $('#cam'), testImg: $('#testImg'), testVid: $('#testVid'),
   overlay: $('#overlay'), stageMsg: $('#stageMsg'),
-  startBtn: $('#startBtn'), stopBtn: $('#stopBtn'), testNotifyBtn: $('#testNotifyBtn'), dimBtn: $('#dimBtn'), flipBtn: $('#flipBtn'), torchBtn: $('#torchBtn'), stTorch: $('#stTorch'),
+  startBtn: $('#startBtn'), stopBtn: $('#stopBtn'), testNotifyBtn: $('#testNotifyBtn'), dimBtn: $('#dimBtn'), flipBtn: $('#flipBtn'), view: $('#view'), torchBtn: $('#torchBtn'), stTorch: $('#stTorch'),
   stState: $('#stState'), stJudge: $('#stJudge'), stRate: $('#stRate'), stLast: $('#stLast'),
   stCount: $('#stCount'), stViewers: $('#stViewers'), stNet: $('#stNet'), stWake: $('#stWake'), stRec: $('#stRec'),
   boost: $('#boost'), record: $('#record'), recGraceSec: $('#recGraceSec'), clips: $('#clips'), clipsInfo: $('#clipsInfo'), clipsClear: $('#clipsClear'),
@@ -1106,6 +1108,34 @@ function watchFrames(s) {
   };
   els.cam.requestVideoFrameCallback(cb);
 }
+// 画角：iPhone のカメラは 4:3 が全体。16:9 にすると上下が切れて狭くなるので、初期設定は 4:3 にする
+const VIEW_SIZE = { normal: { w: 1280, h: 960 }, ultra: { w: 1280, h: 960 }, hd: { w: 1280, h: 720 } };
+function videoConstraints(extra = {}) {
+  const z = VIEW_SIZE[settings.view];
+  // コマ数を15に抑えると、暗いときにシャッターを長く開けられて、少し明るく映る
+  return { audio: false, video: { width: { ideal: z.w }, height: { ideal: z.h }, frameRate: { ideal: lowLightFps() }, ...extra } };
+}
+const gum = (c) => navigator.mediaDevices.getUserMedia(c);
+async function openStream() {
+  const normal = () => gum(videoConstraints({ facingMode: { ideal: settings.facing } }));
+  let s = await normal();
+  if (settings.view !== 'ultra' || settings.facing !== 'environment') return s;
+  // 超広角：ラベルに「Ultra Wide」「超広角」が付いたカメラを探す（許可を得たあとに、名前が分かる）
+  let id = null;
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    id = devs.find((d) => d.kind === 'videoinput' && /ultra|超広角/i.test(d.label))?.deviceId ?? null;
+  } catch { /* 探せなければ標準のカメラ */ }
+  if (!id) { if (!openStream.warned) { openStream.warned = true; addLog('超広角カメラが見つかりません。標準のカメラを使います', 'warn'); } return s; }
+  if (s.getVideoTracks()[0]?.getSettings().deviceId === id) return s;
+  s.getTracks().forEach((t) => t.stop());  // iPhone は2つのカメラを同時に使えない
+  try {
+    return await gum(videoConstraints({ deviceId: { exact: id } }));
+  } catch (e) {
+    addLog(`超広角カメラを開けませんでした（${errText(e)}）。標準のカメラを使います`, 'warn');
+    return normal();
+  }
+}
 async function startCamera() {
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
     const e = new Error('insecure');
@@ -1113,11 +1143,7 @@ async function startCamera() {
     throw e;
   }
   stopCamera();
-  const s = await navigator.mediaDevices.getUserMedia({
-    audio: false,
-    // コマ数を15に抑えると、暗いときにシャッターを長く開けられて、少し明るく映る
-    video: { facingMode: { ideal: settings.facing }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: lowLightFps() } },
-  });
+  const s = await openStream();
   stream = s;
   tuneExposure(s);
   els.cam.srcObject = s;
@@ -1658,6 +1684,7 @@ function renderSettings() {
   els.record.checked = settings.record;
   els.recGraceSec.value = String(settings.recGraceSec);
   els.boost.value = settings.boost;
+  els.view.value = settings.view;
   renderRoiText();
 }
 els.topic.addEventListener('change', () => {
@@ -1732,6 +1759,12 @@ els.model.addEventListener('change', () => {
 for (const key of ['fps', 'absentSec', 'minIntervalSec', 'recGraceSec', 'repeatSec']) {
   els[key].addEventListener('change', () => { settings[key] = Number(els[key].value); saveSettings(); });
 }
+els.view.addEventListener('change', () => {
+  settings.view = els.view.value;
+  saveSettings();
+  addLog(`画角：${els.view.selectedOptions[0].textContent}`, 'info');
+  if (running) startCamera().catch((e) => reportError('カメラを開き直せませんでした', cameraErrorText(e)));  // 映像は差しかえで続く
+});
 els.boost.addEventListener('change', () => { setLowLight(els.boost.value); });
 els.record.addEventListener('change', () => {
   settings.record = els.record.checked;
