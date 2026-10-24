@@ -11,6 +11,7 @@ const els = {
   topic: $('#vTopic'), settings: $('#vSettings'),
   banner: $('#vBanner'), overlay: $('#vOverlay'),
   flip: $('#vFlip'), torch: $('#vTorch'), low: $('#vLow'), why: $('#vWhy'),
+  clips: $('#vClips'), clipsInfo: $('#vClipsInfo'),
 };
 
 // 合言葉：招待リンクで届いたもの → 自分で入れたもの → 同じブラウザのカメラ側の設定（パソコンで2つのタブを試すとき）
@@ -60,6 +61,9 @@ function onStatus(code) {
   if (code === 'live') showMsg('');
   else showMsg(STAGE_TEXT[code] ?? '');
   if (code !== 'live') els.kind.textContent = '—';
+  if (code === 'connected' && lastCode !== 'live') link?.send({ t: 'clips' });  // つながったら、録画の一覧をもらう
+  if (!live) { stopDownload(false); clipList = []; }
+  renderClips();
   if (code === 'notfound' || code === 'badkey' || code === 'busy' || code === 'server') els.cam.textContent = '—';
   if (code !== lastCode) {
     lastCode = code;
@@ -217,7 +221,159 @@ setInterval(() => { if (dets.length && Date.now() - detsAt > 2_000) { dets = [];
 window.addEventListener('resize', drawDets);
 els.video.addEventListener('loadedmetadata', drawDets);
 
+// ---------- カメラ側の録画（一覧 → 受け取り → 再生） ----------
+const GROUP_NAME = { animal: '動物', person: '人' };
+const CLIP_CACHE_MAX = 3;           // 受け取った録画を覚えておく本数（多いとメモリを使うため）
+const CLIP_STALL_MS = 20_000;       // これだけ何も届かなければ、受け取りをあきらめる
+let clipList = [];                  // カメラ側の録画の一覧（新しい順）
+const clipBlobs = new Map();        // id → { blob, url }（受け取り済み）
+let dl = null;                      // いま受け取り中：{ id, n, got, size, type, parts, timer }
+const openClips = new Set();        // 再生のために開いている録画の id
+
+const fmtMB = (b) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)}MB` : `${Math.max(1, Math.round(b / 1e3))}KB`);
+function fmtClipTitle(c) {
+  const d = new Date(c.startedAt);
+  const when = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  const dur = Math.max(1, Math.round((c.endedAt - c.startedAt) / 1000));
+  const what = (c.labels || []).map((g) => GROUP_NAME[g]).filter(Boolean).join('・');
+  return `${when}　${what ? what + '・' : ''}${fmtSec(dur)}・${fmtMB(c.size)}`;
+}
+function rememberClip(id, blob) {
+  const old = clipBlobs.get(id);
+  if (old) URL.revokeObjectURL(old.url);
+  clipBlobs.delete(id);
+  clipBlobs.set(id, { blob, url: URL.createObjectURL(blob) });
+  while (clipBlobs.size > CLIP_CACHE_MAX) {
+    // いちばん古いものから忘れる（開いているものは、なるべく残す）
+    const k = [...clipBlobs.keys()].find((id) => !openClips.has(id)) ?? clipBlobs.keys().next().value;
+    URL.revokeObjectURL(clipBlobs.get(k)?.url);
+    clipBlobs.delete(k);
+    openClips.delete(k);
+  }
+}
+function stopDownload(send = true) {
+  if (!dl) return;
+  clearTimeout(dl.timer);
+  if (send) link?.send({ t: 'clipstop', id: dl.id });
+  dl = null;
+}
+function armStall() {
+  clearTimeout(dl.timer);
+  dl.timer = setTimeout(() => {
+    addLog('録画が途中で届かなくなりました', 'warn');
+    stopDownload();
+    renderClips();
+  }, CLIP_STALL_MS);
+}
+function renderClips() {
+  els.clips.textContent = '';
+  els.clipsInfo.textContent = clipList.length ? `${clipList.length}本` : '';
+  if (!link || !live) {
+    const li = document.createElement('li');
+    li.className = 'help';
+    li.textContent = '「見る」でカメラにつながると、録画の一覧が出ます';
+    els.clips.append(li);
+    return;
+  }
+  for (const c of clipList) {
+    const li = document.createElement('li');
+    const title = document.createElement('div');
+    title.className = 'clip-title';
+    title.textContent = fmtClipTitle(c);
+    const row = document.createElement('div');
+    row.className = 'row';
+    const btn = document.createElement('button');
+    btn.className = 'btn small';
+    const have = clipBlobs.get(c.id);
+    const loading = dl && dl.id === c.id;
+    btn.textContent = loading ? `受け取り中 ${Math.round((dl.got / dl.n) * 100)}%` : openClips.has(c.id) ? '閉じる' : have ? '再生' : `見る（${fmtMB(c.size)}）`;
+    btn.disabled = !!dl && !loading;
+    row.append(btn);
+    if (loading) {
+      const cancel = document.createElement('button');
+      cancel.className = 'btn small';
+      cancel.textContent = 'やめる';
+      cancel.addEventListener('click', () => { stopDownload(); renderClips(); });
+      row.append(cancel);
+    }
+    li.append(title, row);
+    if (openClips.has(c.id) && have) {
+      const v = document.createElement('video');
+      v.src = have.url;
+      v.controls = true;
+      v.playsInline = true;
+      v.muted = true;
+      v.autoplay = true;
+      li.append(v);
+    }
+    btn.addEventListener('click', () => {
+      if (loading) return;
+      if (openClips.has(c.id)) { openClips.delete(c.id); renderClips(); return; }
+      if (have) { openClips.add(c.id); renderClips(); return; }
+      if (!link?.send({ t: 'clipget', id: c.id })) { addLog('録画を受け取れません（カメラにつながっていません）', 'warn'); return; }
+      dl = { id: c.id, n: 0, got: 0, size: c.size, type: c.type, parts: [], timer: null };
+      armStall();
+      renderClips();
+    });
+    els.clips.append(li);
+  }
+}
+function onClipList(m) {
+  clipList = (Array.isArray(m.list) ? m.list : []).slice(0, 30).filter((c) => c && typeof c.id === 'string').map((c) => ({
+    id: c.id, startedAt: Number(c.startedAt) || 0, endedAt: Number(c.endedAt) || 0,
+    labels: Array.isArray(c.labels) ? c.labels.slice(0, 5) : [], size: Number(c.size) || 0, type: shortText(c.type, 60),
+  }));
+  // カメラ側で消された録画は、こちらでも忘れる
+  for (const id of [...clipBlobs.keys()]) if (!clipList.some((c) => c.id === id)) { URL.revokeObjectURL(clipBlobs.get(id)?.url); clipBlobs.delete(id); openClips.delete(id); }
+  renderClips();
+}
+function onClipMeta(m) {
+  if (!dl || dl.id !== m.id) return;
+  if (!m.ok || !Number.isInteger(m.n) || m.n < 1) {
+    addLog(`録画：${shortText(m.msg, 60) || '受け取れませんでした'}`, 'warn');
+    stopDownload(false);
+    renderClips();
+    return;
+  }
+  dl.n = m.n;
+  dl.size = Number(m.size) || dl.size;
+  dl.type = shortText(m.type, 60) || dl.type;
+  armStall();
+  renderClips();
+}
+let lastClipPaint = 0;
+function onClipData(m) {
+  if (!dl || dl.id !== m.id || !dl.n || !Number.isInteger(m.i) || m.i < 0 || m.i >= dl.n || typeof m.data !== 'string' || dl.parts[m.i]) return;
+  try {
+    const bin = atob(m.data);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    dl.parts[m.i] = bytes;
+  } catch {
+    addLog('録画のデータが壊れていました', 'error');
+    stopDownload();
+    renderClips();
+    return;
+  }
+  dl.got += 1;
+  armStall();
+  if (dl.got < dl.n) {
+    if (Date.now() - lastClipPaint > 300) { lastClipPaint = Date.now(); renderClips(); }  // 進みぐあいは、ときどきだけ描き直す
+    return;
+  }
+  const id = dl.id;
+  const blob = new Blob(dl.parts, { type: dl.type.split(';')[0] || 'video/mp4' });
+  stopDownload(false);
+  rememberClip(id, blob);
+  openClips.add(id);
+  addLog(`録画を受け取りました（${fmtMB(blob.size)}）`, 'ok');
+  renderClips();
+}
+
 function onMessage(m) {
+  if (m.t === 'cliplist') { onClipList(m); return; }
+  if (m.t === 'clipmeta') { onClipMeta(m); return; }
+  if (m.t === 'clipdata') { onClipData(m); return; }
   if (m.t === 'event') { onEvent(m); return; }
   if (m.t === 'photo') { onPhotoPart(m); return; }
   if (m.t === 'dets') { onDets(m); return; }
@@ -314,6 +470,9 @@ function stopWatching() {
   camState = null;
   for (const p of pendingCmds.values()) clearTimeout(p.timer);
   pendingCmds.clear();
+  stopDownload(false);
+  clipList = [];
+  renderClips();
   renderOps();
   showMsg('「見る」を押すと、カメラ側の映像を探します');
 }
@@ -351,6 +510,7 @@ els.topic.addEventListener('change', () => {
 
 // ---------- 起動 ----------
 renderLog();
+renderClips();
 if (!topic) {
   els.settings.open = true;
   showMsg('合言葉を入れてください（下の「設定」）');

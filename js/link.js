@@ -182,7 +182,10 @@ export function createCameraLink({ topic, getState, onViewers = () => {}, onStat
     } else if (m.t === 'ping') {
       safeSend(v.conn, { t: 'pong' });
     } else if (m.t !== 'pong') {
-      onMessage(m, (reply) => safeSend(v.conn, reply));
+      const reply = (r) => safeSend(v.conn, r);
+      reply.buffered = () => v.conn.dataChannel?.bufferedAmount ?? 0;  // まだ送り終えていない量（録画を送るときの流れ制御に使う）
+      reply.alive = () => viewers.get(v.peerId) === v;                  // この見る人がまだつながっているか
+      onMessage(m, reply);
     }
   }
   function callViewer(v) {

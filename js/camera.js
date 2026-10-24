@@ -917,6 +917,7 @@ async function renderClips() {
     els.clipsInfo.textContent = '録画の保存場所を使えません';
     return;
   }
+  pushClips();  // 見ている人にも、録画が増えた・減ったことを知らせる
   clipUrls.forEach((u) => URL.revokeObjectURL(u));
   clipUrls = [];
   els.clips.textContent = '';
@@ -1078,8 +1079,66 @@ async function setLowLight(v) {
   return { ok: true, msg: '' };
 }
 
+// ---------- 録画を見る側（A）に見せる ----------
+// 一覧（新しい順に30本まで）。データ通信は1回16KBまでなので、一覧は小さく保つ
+const CLIP_LIST_MAX = 30;
+const CLIP_PART_BYTES = 7_500;      // 1かけら＝7,500バイト（文字にすると約10,000文字）
+const CLIP_BUFFER_MAX = 512_000;    // これ以上たまっていたら、送り終わるのを待つ
+let clipSendId = null;              // いま送っている録画（新しい依頼が来たら、前のは中止する）
+async function clipListMsg() {
+  const list = (await clipsAll()).slice(0, CLIP_LIST_MAX).map((c) => ({
+    id: c.id, startedAt: c.startedAt, endedAt: c.endedAt, labels: c.labels, size: c.size, type: c.type,
+  }));
+  return { t: 'cliplist', list };
+}
+async function pushClips() {
+  if (!cameraLink?.viewers()) return;
+  try { cameraLink.send(await clipListMsg()); } catch { /* 一覧を送れなくても、見張りは続ける */ }
+}
+function toBase64(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x2000) s += String.fromCharCode(...bytes.subarray(i, i + 0x2000));
+  return btoa(s);
+}
+async function sendClip(id, reply) {
+  const token = String(id);
+  clipSendId = token;
+  const stillWanted = () => clipSendId === token && reply.alive();
+  let clip = null;
+  try { clip = (await clipsAll()).find((c) => c.id === token); } catch { /* 見つからない扱い */ }
+  if (!clip) { reply({ t: 'clipmeta', id: token, ok: false, msg: 'この録画は、もうありません' }); return; }
+  const n = Math.ceil(clip.size / CLIP_PART_BYTES);
+  reply({ t: 'clipmeta', id: token, ok: true, n, size: clip.size, type: clip.type });
+  addLog(`見る側に録画を送ります（${fmtSize(clip.size)}）`, 'info');
+  try {
+    for (let i = 0; i < n; i++) {
+      if (!stillWanted()) { addLog('録画の送信をやめました', 'info'); return; }
+      while (reply.buffered() > CLIP_BUFFER_MAX) {
+        await new Promise((r) => setTimeout(r, 40));
+        if (!stillWanted()) { addLog('録画の送信をやめました', 'info'); return; }
+      }
+      const buf = await clip.blob.slice(i * CLIP_PART_BYTES, (i + 1) * CLIP_PART_BYTES).arrayBuffer();
+      reply({ t: 'clipdata', id: token, i, data: toBase64(new Uint8Array(buf)) });
+    }
+    addLog('見る側に録画を送り終えました', 'ok');
+  } catch (e) {
+    reportError('録画を送れませんでした', e);
+  } finally {
+    if (clipSendId === token) clipSendId = null;
+  }
+}
+async function handleClipMsg(m, reply) {
+  if (m.t === 'clips') reply(await clipListMsg());
+  else if (m.t === 'clipget') sendClip(m.id, reply);
+  else if (m.t === 'clipstop') { if (clipSendId === String(m.id)) clipSendId = null; }
+}
+
 // 見る側（A）からの命令を受ける
 async function handleCmd(m, reply) {
+  if (m.t === 'clips' || m.t === 'clipget' || m.t === 'clipstop') {
+    try { await handleClipMsg(m, reply); } catch (e) { reportError('録画の一覧を送れませんでした', e); }
+    return;
+  }
   const done = (r) => { reply({ t: 'result', id: m.id, ok: r.ok, msg: r.msg || '' }); cameraLink?.pushState(); };
   const label = m.name === 'flip' ? 'カメラ切替' : m.name === 'torch' ? 'ライト' : m.name === 'lowlight' ? '低光量モード' : '不明な命令';
   addLog(`見る側から命令が届きました：${label}`, 'info');
