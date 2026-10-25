@@ -10,7 +10,9 @@ const DEAD_MS = 30_000;                 // これだけ返事がなければ切�
 const BITRATE_DIRECT = 1_000_000;       // 直接つながったときの上限（約1Mbps）
 const BITRATE_RELAY = 300_000;          // 中継のときの上限（約300kbps）
 const SERVER_RETRY_MS = 5_000;
-const ID_RETRY_MAX_MS = 120_000;        // 前のIDが残っているとき、試し続ける最長
+const ID_RETRY_MAX_MS = 120_000;        // 前のIDが残っているとき、5秒ごとに急いで試す長さ
+const ID_SLOW_RETRY_MS = 30_000;        // それを過ぎたら、この間隔で試し続ける
+const WATCH_MS = 30_000;                // サーバーとのつながりを見回る間隔
 const VIEWER_RETRY_MS = [5_000, 10_000, 30_000];  // 以後は30秒ごと
 const BUSY_RETRY_MS = 10_000;
 const DENY_RETRY_MS = 30_000;
@@ -74,7 +76,9 @@ export function createCameraLink({ topic, getState, onViewers = () => {}, onStat
   let idDeadline = 0;
   let serverDown = false;
   let restartTimer = null;
+  let restartPending = false;
   let reconnectTimer = null;
+  let idGaveUp = false;
   const viewers = new Map();  // A の ID → { conn, call, authed, nonce, lastRx, authTimer }
 
   const authedCount = () => [...viewers.values()].filter((v) => v.authed).length;
@@ -86,7 +90,6 @@ export function createCameraLink({ topic, getState, onViewers = () => {}, onStat
       if (closed) return;
       myId = await cameraPeerId(topic);
       if (closed) return;
-      idDeadline = Date.now() + ID_RETRY_MAX_MS;
       open();
     } catch (e) {
       markDown(`映像をつなぐ準備ができません（${errText(e)}）`);
@@ -107,6 +110,8 @@ export function createCameraLink({ topic, getState, onViewers = () => {}, onStat
       if (serverDown || !p.__logged) addLog('映像をつなぐサーバーにつながりました。見る人を待っています', 'info');
       p.__logged = true;
       serverDown = false;
+      idDeadline = 0;  // 次に「ID 使用中」になったら、そこからまた2分は急いで試す
+      idGaveUp = false;
       onStatus('ready');
     });
     p.on('connection', onConnection);
@@ -114,10 +119,14 @@ export function createCameraLink({ topic, getState, onViewers = () => {}, onStat
     p.on('error', (e) => {
       if (peer !== p || closed) return;
       if (e.type === 'unavailable-id') {
-        // 読み込み直した直後は、前のIDがサーバーに残っていることがある
+        // 読み込み直した直後や、通信が切れた直後は、前のIDがサーバーに残っていることがある
+        // 最初の2分は5秒ごと、そのあとは30秒ごとに、あきらめずに試し続ける（長くつなぎっぱなしでも止まらないように）
+        if (!idDeadline) idDeadline = Date.now() + ID_RETRY_MAX_MS;
         if (Date.now() < idDeadline) { restartPeer(5_000); return; }
-        addLog('映像用のIDが使用中のままです。しばらくして、見張りを始め直してください', 'error');
+        if (!idGaveUp) addLog('映像用のIDが使用中のままです。30秒ごとに試し続けます（見張りと通知は続けます）', 'warn');
+        idGaveUp = true;
         onStatus('id-taken');
+        restartPeer(ID_SLOW_RETRY_MS);
         return;
       }
       if (e.type === 'peer-unavailable' || e.type === 'webrtc') return;  // 相手側の事情。つなぎ直しは A がする
@@ -129,7 +138,8 @@ export function createCameraLink({ topic, getState, onViewers = () => {}, onStat
     clearTimeout(restartTimer);
     try { peer?.destroy(); } catch { /* すでに閉じている */ }
     peer = null;
-    restartTimer = setTimeout(open, delay);
+    restartPending = true;
+    restartTimer = setTimeout(() => { restartPending = false; open(); }, delay);
   }
   function scheduleReconnect() {
     if (closed || reconnectTimer) return;
@@ -239,6 +249,12 @@ export function createCameraLink({ topic, getState, onViewers = () => {}, onStat
     }
   }, PING_MS);
   const stateTimer = setInterval(() => { if (authedCount()) pushState(); }, 5_000);
+  // 見回り：サーバーとのつながりが切れたまま、だれも直していなければ、つなぎ直す
+  const watchTimer = setInterval(() => {
+    if (closed || restartPending || reconnectTimer || !myId) return;
+    if (!peer || peer.destroyed) restartPeer(0);
+    else if (peer.disconnected) scheduleReconnect();
+  }, WATCH_MS);
 
   start();
   return {
@@ -262,6 +278,7 @@ export function createCameraLink({ topic, getState, onViewers = () => {}, onStat
       closed = true;
       clearInterval(pingTimer);
       clearInterval(stateTimer);
+      clearInterval(watchTimer);
       clearTimeout(restartTimer);
       clearTimeout(reconnectTimer);
       for (const v of [...viewers.values()]) drop(v);
@@ -331,11 +348,22 @@ export function createViewerLink({ topic, macKey, onStatus = () => {}, onStream 
       if (e.type === 'webrtc') return;
       status('server');
       if (p.destroyed) { try { p.destroy(); } catch { /* 閉じ済み */ } peer = null; retryTimer = setTimeout(openPeer, SERVER_RETRY_MS); }
+      else if (!authed) scheduleRetry(SERVER_RETRY_MS * 2);  // まだカメラにつながっていなければ、作り直してつなぐ（見ている映像は切らない）
     });
   }
   function scheduleRetry(ms) {
     clearTimeout(retryTimer);
-    retryTimer = setTimeout(() => { if (!closed && peer && !peer.destroyed && !peer.disconnected) connect(); }, ms);
+    retryTimer = setTimeout(() => {
+      if (closed) return;
+      if (peer && !peer.destroyed && !peer.disconnected) connect();
+      else restartPeer();  // サーバーとの線が切れたままなら、作り直してからつなぐ（ここで止まらないように）
+    }, ms);
+  }
+  function restartPeer() {
+    clearTimeout(retryTimer);
+    try { peer?.destroy(); } catch { /* 閉じ済み */ }
+    peer = null;
+    openPeer();
   }
   function teardown() {
     clearTimeout(authTimer);
