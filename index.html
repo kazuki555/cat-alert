@@ -89,6 +89,9 @@
     appearance: none; border: 0; border-radius: 999px; padding: 10px 16px; min-height: 44px;
     background: rgba(0, 0, 0, .55); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
   }
+  .full-exit:disabled { opacity: .45; cursor: default; }
+  /* 全画面のときのカメラ切替：下のまん中（指が届きやすい位置） */
+  .full-flip { top: auto; right: auto; left: 50%; transform: translateX(-50%); bottom: calc(env(safe-area-inset-bottom) + 16px); padding: 12px 22px; font-size: 1.05rem; }
   body.no-scroll { overflow: hidden; }
   #overlay.editing { pointer-events: auto; touch-action: none; cursor: crosshair; }
   .stage-msg {
@@ -200,6 +203,7 @@
       <canvas id="vOverlay"></canvas>
       <div id="vMsg" class="stage-msg">「見る」を押すと、カメラ側の映像を探します</div>
       <button id="vFullExit" class="full-exit" hidden>✕ 戻る</button>
+      <button id="vFullFlip" class="full-exit full-flip" hidden disabled>🔄 カメラ切替</button>
     </section>
 
     <div class="controls">

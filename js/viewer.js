@@ -6,7 +6,7 @@ setLogElement($('#vLog'));
 
 const els = {
   video: $('#vVideo'), msg: $('#vMsg'), stage: $('#vStage'),
-  watch: $('#vWatch'), stop: $('#vStop'), full: $('#vFull'), fullExit: $('#vFullExit'),
+  watch: $('#vWatch'), stop: $('#vStop'), full: $('#vFull'), fullExit: $('#vFullExit'), fullFlip: $('#vFullFlip'),
   link: $('#vLink'), kind: $('#vKind'), cam: $('#vCam'), wake: $('#vWake'),
   topic: $('#vTopic'), settings: $('#vSettings'),
   banner: $('#vBanner'), overlay: $('#vOverlay'),
@@ -399,6 +399,7 @@ function renderOps() {
   const st = camState;
   const busy = pendingCmds.size > 0;
   els.flip.disabled = !st || busy;
+  els.fullFlip.disabled = els.flip.disabled;  // 全画面のときのカメラ切替も同じ
   // ライト：使えないときは、薄くして理由を出す
   const torchOk = !!st && st.torchOk === true;
   els.torch.disabled = !torchOk || busy;
@@ -425,6 +426,7 @@ function sendCmd(name, value, label) {
   renderOps();
 }
 els.flip.addEventListener('click', () => sendCmd('flip', null, 'カメラ切替'));
+els.fullFlip.addEventListener('click', () => sendCmd('flip', null, 'カメラ切替'));
 els.torch.addEventListener('click', () => sendCmd('torch', !camState?.torch, 'ライト'));
 els.low.addEventListener('click', () => sendCmd('lowlight', LOW_NEXT[camState?.lowLight] ?? 'auto', '低光量モード'));
 
@@ -490,6 +492,7 @@ function setFull(on) {
   els.stage.classList.toggle('full', on);
   document.body.classList.toggle('no-scroll', on);
   els.fullExit.hidden = !on;
+  els.fullFlip.hidden = !on;
   requestAnimationFrame(drawDets);
 }
 function enterFull() {
