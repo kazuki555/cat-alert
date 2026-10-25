@@ -4,6 +4,8 @@ import {
   pad, clamp, fmtTime, ymd, stamp, errText, fmtDuration, fmtSize, fmtDateTime, toJpeg,
   addLog, renderLog, reportError, createWakeLock,
 } from './common.js';
+import * as V from './verify.js';
+import { createLearnPanel } from './learnui.js';
 
 
 // ---------- 定数 ----------
@@ -13,27 +15,24 @@ const MODEL_URLS = {
   lite0: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite',
   lite2: 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/1/efficientdet_lite2.tflite',
 };
-// 見つける対象のグループ：表示名・AI(COCO)のラベル・ntfy のタグ（タグは通知タイトルの絵文字になる）
+// 見つける対象は猫だけ：表示名・ntfy のタグ（タグは通知タイトルの絵文字になる）
 const GROUPS = {
-  animal: { label: '動物', labels: ['bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe'], tag: 'paw_prints' },
-  person: { label: '人', labels: ['person'], tag: 'bust_in_silhouette' },
+  cat: { label: '猫', labels: ['cat'], tag: 'cat' },
 };
-// AIのラベル名 → 日本語名（枠の文字や通知の（）の中に使う）
-const LABEL_JA = {
-  bird: '鳥', cat: '猫', dog: '犬', horse: '馬', sheep: '羊', cow: '牛',
-  elephant: '象', bear: 'クマ', zebra: 'シマウマ', giraffe: 'キリン', person: '人',
-};
-const labelJa = (l) => LABEL_JA[l] ?? l;
-// 選んだグループに入っているAIのラベルを全部合わせたもの
-const targetLabels = () => settings.targets.flatMap((g) => GROUPS[g].labels);
-// いちばん確かな検知の「名前・確からしさ」（例：猫・92%）
-const bestText = (hits) => {
-  const b = hits.reduce((a, h) => (h.score > a.score ? h : a));
-  return `${labelJa(b.label)}・${Math.round(b.score * 100)}%`;
-};
+const OLD_GROUP_NAMES = { animal: '動物', person: '人' };  // 前の版で録った録画の表示用
+// 1段目（物体検出）が猫を見まちがえやすいもの。ここに出た候補は、2段目のAIで「猫かどうか」を確かめる
+const CANDIDATE_LABELS = ['cat', 'dog', 'bird', 'bear', 'sheep', 'cow', 'horse', 'teddy bear'];
+const labelJa = (l) => (l === 'cat' ? '猫' : l);
+// いちばん確かな検知の確からしさ（例：92%）
+const bestPct = (hits) => `${Math.round(Math.max(...hits.map((h) => h.score)) * 100)}%`;
 const CONFIRM_N = 5;          // 直近5回の判定のうち
 const CONFIRM_K = 3;          // 3回以上見つかったら「来た」
-const DETECT_FLOOR = 0.25;    // これ未満の候補はAIから受け取らない（点線枠の表示用）
+const DETECT_FLOOR = 0.15;    // 1段目の候補はこれ以上を受け取る（猫を「鳥 30%」などと低く出すことがあるので低め）
+const SHOW_FLOOR = 0.2;       // 2段目で確かめた猫らしさがこれ未満なら、猫ではないとして枠も出さない
+const VERIFY_MAX = 2;         // 1回の判定で確かめる候補の数（多いと B が熱くなる）
+const SAMPLE_MIN = 0.15;      // 猫らしさがこれ以上の写真を「猫の学習」用に保存する
+const SAMPLE_GAP_MS = 8_000;  // 学習用の写真は、この間隔より短くは保存しない
+const LEARN_PAGE = 12;        // 「猫の学習」で一度に出す写真の数
 const WORK_MAX = 640;         // 判定用に縮小するときの最大辺
 const SNAPSHOT_WIDTH = 640;
 const DAILY_CAP = 200;        // ntfy.sh 無料枠（1日250通）より少なく
@@ -53,7 +52,7 @@ const REC_BITRATE = 1_000_000;           // 約1Mbps（1分で約7.5MB）
 const DEFAULTS = {
   server: 'https://ntfy.sh',
   topic: '',
-  targets: ['animal'],
+  targets: ['cat'],
   threshold: 0.5,
   model: 'lite0',
   fps: 3,
@@ -71,17 +70,15 @@ const DEFAULTS = {
   view: 'normal',
 };
 const settings = { ...DEFAULTS, ...load('settings', {}) };
-// v5：対象を「猫・犬・人」から「動物・人」に置きかえる（1回だけ。cat／dog があれば animal にする）
-if (settings.ver !== 5) {
-  const old = Array.isArray(settings.targets) ? settings.targets : [];
-  const next = [];
-  if (old.some((t) => t === 'cat' || t === 'dog' || t === 'animal')) next.push('animal');
-  if (old.includes('person')) next.push('person');
-  settings.targets = next;
-  settings.ver = 5;
+// v6：対象を猫だけにする。猫らしさの出し方（2段目で確かめる）が変わったので、判定の厳しさも標準に戻す（1回だけ）
+if (settings.ver !== 6) {
+  if (settings.ver && settings.threshold !== DEFAULTS.threshold) {
+    settings.threshold = DEFAULTS.threshold;
+    setTimeout(() => addLog('猫の見分け方を新しくしたので、「判定の厳しさ」を標準（50%）に戻しました', 'info'), 0);
+  }
+  settings.ver = 6;
 }
-settings.targets = (Array.isArray(settings.targets) ? settings.targets : []).filter((t) => t in GROUPS);
-if (!settings.targets.length) settings.targets = ['animal'];
+settings.targets = ['cat'];
 if (!(settings.model in MODEL_URLS)) settings.model = 'lite0';
 const pick = (v, allowed, def) => (allowed.includes(v) ? v : def);
 settings.fps = pick(settings.fps, [1, 2, 3, 5], DEFAULTS.fps);
@@ -105,7 +102,7 @@ function isValidRoi(r) {
 function isFullRoi(r) { return r.x <= 0.001 && r.y <= 0.001 && r.w >= 0.999 && r.h >= 0.999; }
 
 // ---------- 小物 ----------
-function targetNames(list) { return list.filter((t) => t in GROUPS).map((t) => GROUPS[t].label).join('・'); }
+function targetNames(list) { return list.map((t) => GROUPS[t]?.label ?? OLD_GROUP_NAMES[t]).filter(Boolean).join('・'); }
 
 // ---------- 画面の部品 ----------
 const els = {
@@ -116,7 +113,7 @@ const els = {
   stCount: $('#stCount'), stViewers: $('#stViewers'), stNet: $('#stNet'), stWake: $('#stWake'), stRec: $('#stRec'),
   boost: $('#boost'), record: $('#record'), recGraceSec: $('#recGraceSec'), clips: $('#clips'), clipsInfo: $('#clipsInfo'), clipsClear: $('#clipsClear'),
   settingsBox: $('#settingsBox'), topic: $('#topic'), topicCopy: $('#topicCopy'), topicShare: $('#topicShare'), topicNew: $('#topicNew'),
-  targetBoxes: $$('input[name=target]'), threshold: $('#threshold'), thresholdVal: $('#thresholdVal'),
+  learnPanel: $('#learnPanel'), learnBox: $('#learnBox'), learnReset: $('#learnReset'), threshold: $('#threshold'), thresholdVal: $('#thresholdVal'),
   model: $('#model'), fps: $('#fps'), absentSec: $('#absentSec'), minIntervalSec: $('#minIntervalSec'), repeatSec: $('#repeatSec'),
   roiEdit: $('#roiEdit'), roiReset: $('#roiReset'), roiText: $('#roiText'), gpu: $('#gpu'), server: $('#server'),
   fileInput: $('#fileInput'), sendInTest: $('#sendInTest'), testEnd: $('#testEnd'),
@@ -148,7 +145,7 @@ let running = false;      // カメラで見張り中
 let starting = false;
 let lastDets = [];
 const trackers = {};      // 対象ごとの「来た／いない」の判定状態
-const stats = { viewers: 0, linkDown: false, inferMs: null, rate: null, lastDetectAt: null, net: 'idle', failing: false, wake: '—' };
+const stats = { viewers: 0, linkDown: false, inferMs: null, verifyMs: null, rate: null, lastDetectAt: null, net: 'idle', failing: false, wake: '—' };
 
 function resetTrackers() { for (const k of Object.keys(trackers)) delete trackers[k]; }
 
@@ -174,7 +171,8 @@ function updateStatus() {
   els.stState.textContent = mode === 'camera' && running ? '見張り中' : mode === 'test' ? 'テスト中' : '待機中';
   const now = Date.now();
   els.stJudge.textContent = settings.targets.map((t) => judgeText(t, now)).join(' / ');
-  els.stRate.textContent = stats.rate == null ? '—' : `${stats.rate.toFixed(1)}回/秒・1回 ${Math.round(stats.inferMs)}ms`;
+  els.stRate.textContent = stats.rate == null ? '—' : `${stats.rate.toFixed(1)}回/秒・1回 ${Math.round(stats.inferMs)}ms` +
+    (stats.verifyMs == null ? '' : `＋確かめ ${Math.round(stats.verifyMs)}ms`);
   els.stLast.textContent = stats.lastDetectAt ? fmtTime(stats.lastDetectAt) : '—';
   els.stCount.textContent = `${dailyCount()}件（上限 ${DAILY_CAP}件）`;
   els.stNet.textContent = !navigator.onLine ? 'オフライン（つながるのを待っています）'
@@ -232,7 +230,7 @@ async function ensureDetector() {
   const targets = settings.targets.join(',');
   detectorTask = (async () => {
     if (detector && detectorConf === conf) {
-      await detector.setOptions({ categoryAllowlist: targetLabels() });
+      await detector.setOptions({ categoryAllowlist: CANDIDATE_LABELS });
       detectorTargets = targets;
       return;
     }
@@ -249,7 +247,7 @@ async function ensureDetector() {
         runningMode: 'IMAGE',
         scoreThreshold: DETECT_FLOOR,
         maxResults: 5,
-        categoryAllowlist: targetLabels(),
+        categoryAllowlist: CANDIDATE_LABELS,
       });
       detectorConf = conf;
       detectorTargets = targets;
@@ -386,18 +384,132 @@ async function processFrame() {
   }
 
   // 元の映像の座標に戻す
-  lastDets = result.detections
+  const raw = result.detections
     .filter((d) => d.boundingBox && d.categories && d.categories.length)
     .map((d) => {
       const c = d.categories[0];
       const b = d.boundingBox;
       return { label: c.categoryName, score: c.score, x: cx + b.originX / k, y: cy + b.originY / k, w: b.width / k, h: b.height / k };
     });
+  // 2段目：候補が本当に猫かどうかを確かめる（ここで出た「猫らしさ」で、枠・通知・録画を決める）
+  lastDets = verifyDets(raw, src, sw, sh);
   drawOverlay();
   sendDets(sw, sh);
   if (rec && rec.viaCanvas) drawRecCanvas();
   await updateTrackers(lastDets, src);
   updateStatus();
+}
+
+// ---------- 猫かどうかを確かめる（2段目のAI）と、学習用の写真 ----------
+// 1段目は猫を「鳥 30%」などと出すことがある。候補の部分を元の映像（縮小前）から切り出し、細かく分類するAIでもう一度見る
+let verifierOn = false;       // 2段目のAIを読み込めたか
+let verifierTask = null;
+let verifierRetryAt = 0;
+let verifierFailed = false;
+let lastSampleAt = 0;
+const crops = Array.from({ length: VERIFY_MAX }, () => {
+  const c = document.createElement('canvas');
+  c.width = V.CROP_SIZE;
+  c.height = V.CROP_SIZE;
+  return { c, g: c.getContext('2d', { willReadFrequently: true }) };
+});
+// 2段目のAIは、見張りを止めずに裏で読み込む（読み込めるまでは、1段目が「猫」と言ったものだけを使う）
+function kickVerifier() {
+  if (verifierTask || !mp || !fileset || Date.now() < verifierRetryAt) return;
+  verifierTask = (async () => {
+    await V.loadVerifier(mp, fileset, settings.gpu);
+    verifierOn = true;
+    addLog('猫を確かめるAI（2段目）を読み込みました', 'ok');
+    verifierFailed = false;
+  })();
+  verifierTask.catch((e) => {
+    if (!verifierFailed) addLog(`猫を確かめるAIを読み込めませんでした（${errText(e)}）。1分ごとに試します。それまでは今までの方法で見つけます`, 'warn');
+    verifierFailed = true;
+    verifierRetryAt = Date.now() + 60_000;
+  }).finally(() => { verifierTask = null; });
+}
+// 重なっている候補（同じ猫を「猫」と「鳥」の両方で出すことがある）は1つにまとめる。猫の確からしさは大きいほうを残す
+function iou(a, b) {
+  const x1 = Math.max(a.x, b.x);
+  const y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.w, b.x + b.w);
+  const y2 = Math.min(a.y + a.h, b.y + b.h);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  return inter / (a.w * a.h + b.w * b.h - inter || 1);
+}
+function mergeCandidates(raw) {
+  const out = [];
+  for (const d of [...raw].sort((a, b) => b.score - a.score)) {
+    const detCat = d.label === 'cat' ? d.score : 0;
+    const same = out.find((o) => iou(o, d) > 0.5);
+    if (same) same.detCat = Math.max(same.detCat, detCat);
+    else out.push({ ...d, detCat });
+  }
+  return out;
+}
+// 候補の部分を正方形で切り出す（少し広めに）
+function cropTo(slot, src, d, sw, sh) {
+  const size = slot.c.width;
+  const s = Math.min(Math.max(sw, sh), Math.max(d.w, d.h) * 1.2);
+  const x = clamp(d.x + d.w / 2 - s / 2, 0, Math.max(0, sw - s));
+  const y = clamp(d.y + d.h / 2 - s / 2, 0, Math.max(0, sh - s));
+  slot.g.fillStyle = '#000';
+  slot.g.fillRect(0, 0, size, size);
+  slot.g.drawImage(src, x, y, Math.min(s, sw), Math.min(s, sh), 0, 0, size * Math.min(s, sw) / s, size * Math.min(s, sh) / s);
+  normalizeCrop(slot.g, size);
+  return slot.c;
+}
+// 切り出した部分の明るさとコントラストを、その部分だけで整える（暗い夜でも、2段目のAIが見やすくなる）
+// 画面全体の明るさ補正（低光量モード）をそのまま使うと、強すぎて白くとび、かえって猫と分かりにくくなるため
+function normalizeCrop(g, size) {
+  const img = g.getImageData(0, 0, size, size);
+  const d = img.data;
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < d.length; i += 4) hist[(d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0]++;
+  const cut = (d.length / 4) * 0.01;  // いちばん暗い1%と明るい1%は、ざらつき（ノイズ）として無視する
+  let lo = 0;
+  for (let c = 0; lo < 255; lo++) { c += hist[lo]; if (c > cut) break; }
+  let hi = 255;
+  for (let c = 0; hi > 0; hi--) { c += hist[hi]; if (c > cut) break; }
+  if (lo < 8 && hi > 230) return;  // 明るさの幅がもう十分あるときは、そのまま
+  const range = Math.max(hi - lo, 16);
+  const lut = new Uint8ClampedArray(256);
+  for (let i = 0; i < 256; i++) lut[i] = 255 * Math.pow(Math.min(1, Math.max(0, i - lo) / range), 0.8);
+  for (let i = 0; i < d.length; i += 4) { d[i] = lut[d[i]]; d[i + 1] = lut[d[i + 1]]; d[i + 2] = lut[d[i + 2]]; }
+  g.putImageData(img, 0, 0);
+}
+function verifyDets(raw, src, sw, sh) {
+  if (verifierOn && V.verifierConf() !== (settings.gpu ? 'GPU' : 'CPU')) verifierOn = false;  // GPU の設定を変えたので読み込み直す
+  if (!verifierOn) kickVerifier();
+  if (!verifierOn) {
+    stats.verifyMs = null;
+    return raw.filter((d) => d.label === 'cat' && d.score >= 0.25);  // 読み込めるまでは今までの方法
+  }
+  const t0 = performance.now();
+  const cands = mergeCandidates(raw).filter((d) => Math.min(d.w, d.h) >= 12).slice(0, VERIFY_MAX);
+  const out = [];
+  let best = null;
+  const wantSample = Date.now() - lastSampleAt >= SAMPLE_GAP_MS;
+  cands.forEach((d, i) => {
+    const canvas = cropTo(crops[i], src, d, sw, sh);
+    const r = V.judge(canvas, d.detCat, wantSample);
+    if (r.score >= SHOW_FLOOR) {
+      out.push({ label: 'cat', score: r.score, x: d.x, y: d.y, w: d.w, h: d.h, det: d.label, detScore: d.score, cls: r.cls, learn: r.learn });
+    }
+    if (r.score >= SAMPLE_MIN && (!best || r.score > best.score)) best = { canvas, emb: r.emb, score: r.score };
+  });
+  if (cands.length) {
+    const ms = performance.now() - t0;
+    stats.verifyMs = stats.verifyMs == null ? ms : stats.verifyMs * 0.8 + ms * 0.2;
+  }
+  // 学習用に、猫かもしれない写真をときどき保存する（同じ場面が続くときは保存しない）
+  if (wantSample && best?.emb) {
+    lastSampleAt = Date.now();
+    V.addSample(best.canvas, best.emb, best.score)
+      .then((added) => { if (added) renderLearnCounts(); })
+      .catch((e) => reportError('学習用の写真を保存できませんでした', e));
+  }
+  return out;
 }
 
 // ---------- 「来た／いない」の判定 ----------
@@ -436,7 +548,7 @@ async function updateTrackers(dets, src) {
 
 async function onArrival(label, hits, src, t, now) {
   const name = GROUPS[label].label;
-  const best = bestText(hits);  // 例：猫・92%
+  const best = bestPct(hits);  // 例：92%
   sendEvent('arrive', label, hits, src);
   stats.lastDetectAt = now;
   let blob = null;
@@ -463,7 +575,7 @@ async function onArrival(label, hits, src, t, now) {
   addLog(`${name}が来ました（${best}）。通知を送ります`, 'detect', thumb);
   enqueue({
     title: `${name}が来ました（${best}）`,
-    message: `${fmtTime(now)} に${name}を検知しました（${best}）${rec ? '。カメラ側で録画しています' : ''}`,
+    message: `${fmtTime(now)} に${name}を検知しました（猫らしさ ${best}）${rec ? '。カメラ側で録画しています' : ''}`,
     tags: GROUPS[label].tag,
     priority: 4,
     blob,
@@ -474,13 +586,12 @@ async function onArrival(label, hits, src, t, now) {
 // 映り続けているときの通知（写真は小さめ）
 async function onStillThere(label, hits, src, t, now) {
   const name = GROUPS[label].label;
-  const best = bestText(hits);
-  const bestName = best.split('・')[0];
+  const best = bestPct(hits);
   const lasted = fmtDuration(now - t.presentSince);
   sendEvent('still', label, hits, src, { sec: Math.round((now - t.presentSince) / 1000) });
   stats.lastDetectAt = now;
   if (mode === 'test' && !settings.sendInTest) {
-    addLog(`${name}がまだいます（${bestName}・${lasted}）。テスト中なので通知は送りません`, 'detect');
+    addLog(`${name}がまだいます（${lasted}）。テスト中なので通知は送りません`, 'detect');
     return;
   }
   if (dailyCount() >= DAILY_CAP - REMIND_RESERVE) {
@@ -499,10 +610,10 @@ async function onStillThere(label, hits, src, t, now) {
     console.warn(e);
   }
   t.lastNotified = now;
-  addLog(`${name}がまだいます（${bestName}・${lasted}）。通知を送ります`, 'detect', thumb);
+  addLog(`${name}がまだいます（${lasted}）。通知を送ります`, 'detect', thumb);
   enqueue({
-    title: `${name}がまだいます（${bestName}・${lasted}）`,
-    message: `${fmtTime(now)}：${name}が映り続けています（${bestName}・${lasted}・確からしさ ${best.split('・')[1]}）${rec ? '。カメラ側で録画しています' : ''}`,
+    title: `${name}がまだいます（${lasted}）`,
+    message: `${fmtTime(now)}：${name}が映り続けています（${lasted}・猫らしさ ${best}）${rec ? '。カメラ側で録画しています' : ''}`,
     tags: GROUPS[label].tag,
     priority: 4,
     blob,
@@ -1133,10 +1244,65 @@ async function handleClipMsg(m, reply) {
   else if (m.t === 'clipstop') { if (clipSendId === String(m.id)) clipSendId = null; }
 }
 
+// ---------- 猫の学習（写真に「猫」「ちがう」を教える。見る側からも教えられる） ----------
+const learnSource = {
+  page: async (view, offset) => {
+    await V.initSamples();
+    return { ...V.listSamples(view, offset, LEARN_PAGE), counts: V.sampleCounts() };
+  },
+  thumb: async (id) => { const b = await V.sampleThumb(id); return b ? URL.createObjectURL(b) : null; },
+  label: async (id, label) => ({ ok: await V.labelSample(id, label), counts: V.sampleCounts() }),
+};
+// 公開した直後は、古い画面（index.html）が残っていることがあるので、欄がなくても止まらないようにする
+const learnPanel = els.learnPanel ? createLearnPanel(els.learnPanel, learnSource, { pageSize: LEARN_PAGE })
+  : { refresh() {}, setCounts() {}, setEnabled() {} };
+function renderLearnCounts() { learnPanel.setCounts(V.sampleCounts()); }
+els.learnBox?.addEventListener('toggle', () => { if (els.learnBox.open) learnPanel.refresh(); });
+els.learnReset?.addEventListener('click', async () => {
+  if (!confirm('「猫の学習」で覚えた写真と答えを、全部消しますか？（元には戻せません）')) return;
+  try {
+    await V.resetSamples();
+    addLog('猫の学習で覚えたことを全部消しました', 'info');
+  } catch (e) {
+    reportError('消せませんでした', e);
+  }
+  learnPanel.refresh();
+});
+const LABEL_TEXT = { cat: '猫', not: 'ちがう' };
+async function handleLearnMsg(m, reply) {
+  await V.initSamples();
+  if (m.t === 'samples') {
+    const view = ['todo', 'cat', 'not'].includes(m.view) ? m.view : 'todo';
+    const offset = Number.isInteger(m.offset) && m.offset >= 0 ? m.offset : 0;
+    const { items, total } = V.listSamples(view, offset, LEARN_PAGE);
+    reply({ t: 'samplelist', req: m.req, view, offset, total, counts: V.sampleCounts(), items });
+    // 写真は1枚ずつ送る（データ通信は1回16KBまで。写真は128pxで5〜8KBほど）
+    for (const it of items) {
+      if (!reply.alive()) return;
+      const b = await V.sampleThumb(it.id);
+      if (!b) continue;
+      const data = await blobToDataUrl(b);
+      if (data.length < 15_000) reply({ t: 'samplethumb', id: it.id, data });
+    }
+  } else if (m.t === 'label') {
+    const label = m.label === 'cat' || m.label === 'not' ? m.label : null;
+    const ok = await V.labelSample(String(m.id), label);
+    reply({ t: 'labeled', req: m.req, id: m.id, ok, counts: V.sampleCounts() });
+    if (ok) {
+      addLog(`見る側から学習の答えが届きました：${LABEL_TEXT[label] ?? 'まだに戻す'}`, 'info');
+      renderLearnCounts();
+    }
+  }
+}
+
 // 見る側（A）からの命令を受ける
 async function handleCmd(m, reply) {
   if (m.t === 'clips' || m.t === 'clipget' || m.t === 'clipstop') {
     try { await handleClipMsg(m, reply); } catch (e) { reportError('録画の一覧を送れませんでした', e); }
+    return;
+  }
+  if (m.t === 'samples' || m.t === 'label') {
+    try { await handleLearnMsg(m, reply); } catch (e) { reportError('学習の写真を送れませんでした', e); }
     return;
   }
   const done = (r) => { reply({ t: 'result', id: m.id, ok: r.ok, msg: r.msg || '' }); cameraLink?.pushState(); };
@@ -1729,7 +1895,6 @@ function renderRoiText() {
 function renderThreshold() { els.thresholdVal.textContent = `${Math.round(settings.threshold * 100)}%以上`; }
 function renderSettings() {
   els.topic.value = settings.topic;
-  els.targetBoxes.forEach((b) => { b.checked = settings.targets.includes(b.value); });
   els.threshold.value = String(settings.threshold);
   renderThreshold();
   els.model.value = settings.model;
@@ -1791,19 +1956,6 @@ els.topicNew.addEventListener('click', () => {
   renderSettings();
   addLog('新しいトピック名を作りました。Aのntfyアプリで購読し直してください', 'info');
 });
-els.targetBoxes.forEach((b) => b.addEventListener('change', () => {
-  const sel = els.targetBoxes.filter((x) => x.checked).map((x) => x.value);
-  if (!sel.length) {
-    b.checked = true;
-    addLog('見つける対象は1つ以上選んでください', 'warn');
-    return;
-  }
-  settings.targets = sel;
-  saveSettings();
-  for (const k of Object.keys(trackers)) if (!sel.includes(k)) delete trackers[k];
-  addLog(`見つける対象：${targetNames(sel)}`, 'info');
-  updateStatus();
-}));
 els.threshold.addEventListener('input', () => {
   settings.threshold = Number(els.threshold.value);
   renderThreshold();
@@ -1908,6 +2060,7 @@ els.testNotifyBtn.addEventListener('click', async () => {
 renderSettings();
 renderLog();
 renderClips();
+V.initSamples().then(renderLearnCounts).catch((e) => reportError('学習用の写真を読み込めませんでした', e));
 updateButtons();
 updateStatus();
 layoutOverlay();

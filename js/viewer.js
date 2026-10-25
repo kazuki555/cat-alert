@@ -1,6 +1,7 @@
 // 猫アラート：見る側（A）の画面。役割が「見る側」のときだけ index.html から読み込まれる
 import { $, load, save, isValidTopic, addLog, renderLog, setLogElement, errText, createWakeLock } from './common.js';
 import { createViewerLink } from './link.js';
+import { createLearnPanel } from './learnui.js';
 
 setLogElement($('#vLog'));
 
@@ -12,6 +13,7 @@ const els = {
   banner: $('#vBanner'), overlay: $('#vOverlay'),
   flip: $('#vFlip'), torch: $('#vTorch'), low: $('#vLow'), why: $('#vWhy'),
   clips: $('#vClips'), clipsInfo: $('#vClipsInfo'),
+  learnBox: $('#vLearnBox'), learnPanel: $('#vLearnPanel'),
 };
 
 // 合言葉：招待リンクで届いたもの → 自分で入れたもの → 同じブラウザのカメラ側の設定（パソコンで2つのタブを試すとき）
@@ -25,6 +27,7 @@ let viewing = false;
 let lastCode = '';
 let camState = null;   // カメラ側から届いた最新の state
 let live = false;
+let learnLive = false;  // 学習の欄が「つながっている」状態で出ているか
 const pendingCmds = new Map();  // id → { name, timer }
 let cmdSeq = 0;
 
@@ -64,6 +67,7 @@ function onStatus(code) {
   if (code === 'connected' && lastCode !== 'live') link?.send({ t: 'clips' });  // つながったら、録画の一覧をもらう
   if (!live) { stopDownload(false); clipList = []; }
   renderClips();
+  if (live !== learnLive) { learnLive = live; syncLearn(); }  // つながった・切れたときだけ、学習の欄を出し直す
   if (code === 'notfound' || code === 'badkey' || code === 'busy' || code === 'server') els.cam.textContent = '—';
   if (code !== lastCode) {
     lastCode = code;
@@ -93,9 +97,9 @@ function camText(s) {
   if (typeof s.viewers === 'number') parts.push(`見ている人 ${s.viewers}人`);
   return parts.join('・');
 }
-// ---------- 動物が来たときの知らせ（帯・音・写真つき記録・枠） ----------
-const GROUP_JA = { animal: '動物', person: '人' };
-const GROUP_ICON = { animal: '🐾', person: '🧍' };
+// ---------- 猫が来たときの知らせ（帯・音・写真つき記録・枠） ----------
+const GROUP_JA = { cat: '猫', animal: '動物', person: '人' };
+const GROUP_ICON = { cat: '🐱', animal: '🐾', person: '🧍' };
 let audioCtx = null;
 let bannerTimer = null;
 // iPhone は、画面を一度タップしないと音を鳴らせない。「見る」を押したときに鳴らせる状態にしておく
@@ -144,9 +148,9 @@ function onPhotoPart(m) {
   if (p.parts.filter((x) => x !== undefined).length === p.n) finishPhoto(m.id, true);
 }
 function onEvent(m) {
-  const group = GROUP_JA[m.group] ? m.group : 'animal';
+  const group = GROUP_JA[m.group] ? m.group : 'cat';
   const g = GROUP_JA[group];
-  const name = shortText(m.name, 12);
+  const name = shortText(m.name, 12) === g ? '' : shortText(m.name, 12);  // 「猫が来ました（猫・92%）」のように重ならないようにする
   const pct = Number.isFinite(m.pct) ? Math.round(m.pct) : null;
   if (m.kind === 'gone') {
     addLog(`${g}がいなくなりました`, 'info');
@@ -222,7 +226,7 @@ window.addEventListener('resize', drawDets);
 els.video.addEventListener('loadedmetadata', drawDets);
 
 // ---------- カメラ側の録画（一覧 → 受け取り → 再生） ----------
-const GROUP_NAME = { animal: '動物', person: '人' };
+const GROUP_NAME = { cat: '猫', animal: '動物', person: '人' };
 const CLIP_CACHE_MAX = 3;           // 受け取った録画を覚えておく本数（多いとメモリを使うため）
 const CLIP_STALL_MS = 20_000;       // これだけ何も届かなければ、受け取りをあきらめる
 let clipList = [];                  // カメラ側の録画の一覧（新しい順）
@@ -370,7 +374,75 @@ function onClipData(m) {
   renderClips();
 }
 
+// ---------- 猫の学習（カメラ側の写真に「猫」「ちがう」を教える） ----------
+const LEARN_WAIT_MS = 10_000;
+const THUMB_KEEP = 200;             // 受け取った写真を覚えておく枚数
+let learnReq = 0;
+const learnWait = new Map();        // 頼んだ番号 → { resolve, timer }
+const learnThumbs = new Map();      // 写真の id → data URL
+const thumbWait = new Map();        // 写真の id → [resolve, ...]
+// カメラ側に頼んで、返事を待つ（返事がなければ null）
+function askCamera(msg) {
+  return new Promise((resolve) => {
+    const req = ++learnReq;
+    if (!link?.send({ ...msg, req })) { resolve(null); return; }
+    const timer = setTimeout(() => { learnWait.delete(req); resolve(null); }, LEARN_WAIT_MS);
+    learnWait.set(req, { resolve, timer });
+  });
+}
+function answerFor(m) {
+  const w = learnWait.get(m.req);
+  if (!w) return;
+  clearTimeout(w.timer);
+  learnWait.delete(m.req);
+  w.resolve(m);
+}
+const counts = (c) => ({ todo: Number(c?.todo) || 0, cat: Number(c?.cat) || 0, not: Number(c?.not) || 0 });
+const learnSource = {
+  page: async (view, offset) => {
+    const r = await askCamera({ t: 'samples', view, offset });
+    if (!r) throw new Error('カメラから返事がありません');
+    const items = (Array.isArray(r.items) ? r.items.slice(0, 50) : []).filter((it) => it && typeof it.id === 'string').map((it) => ({
+      id: shortText(it.id, 40), at: Number(it.at) || 0, score: Number(it.score) || 0,
+      label: it.label === 'cat' || it.label === 'not' ? it.label : null,
+    }));
+    return { items, total: Number(r.total) || 0, counts: counts(r.counts) };
+  },
+  thumb: (id) => {
+    if (learnThumbs.has(id)) return Promise.resolve(learnThumbs.get(id));
+    return new Promise((resolve) => {
+      const list = thumbWait.get(id) ?? [];
+      list.push(resolve);
+      thumbWait.set(id, list);
+      setTimeout(() => resolve(null), LEARN_WAIT_MS);
+    });
+  },
+  label: async (id, label) => {
+    const r = await askCamera({ t: 'label', id, label });
+    return r ? { ok: r.ok === true, counts: counts(r.counts) } : { ok: false };
+  },
+};
+function onSampleThumb(m) {
+  if (typeof m.id !== 'string' || typeof m.data !== 'string' || !m.data.startsWith('data:image/jpeg;base64,') || m.data.length > 20_000) return;
+  learnThumbs.set(m.id, m.data);
+  while (learnThumbs.size > THUMB_KEEP) learnThumbs.delete(learnThumbs.keys().next().value);
+  for (const resolve of thumbWait.get(m.id) ?? []) resolve(m.data);
+  thumbWait.delete(m.id);
+}
+// 公開した直後は、古い画面（index.html）が残っていることがあるので、欄がなくても止まらないようにする
+const learnPanel = els.learnPanel ? createLearnPanel(els.learnPanel, learnSource) : { refresh() {}, setCounts() {}, setEnabled() {} };
+const LEARN_OFF_TEXT = '「見る」でカメラにつながると、写真が出ます';
+learnPanel.setEnabled(false, LEARN_OFF_TEXT);
+function syncLearn() {
+  const on = !!link && live;
+  learnPanel.setEnabled(on, LEARN_OFF_TEXT);
+  if (on && els.learnBox?.open) learnPanel.refresh();
+}
+els.learnBox?.addEventListener('toggle', () => { if (els.learnBox.open && link && live) learnPanel.refresh(); });
+
 function onMessage(m) {
+  if (m.t === 'samplelist' || m.t === 'labeled') { answerFor(m); return; }
+  if (m.t === 'samplethumb') { onSampleThumb(m); return; }
   if (m.t === 'cliplist') { onClipList(m); return; }
   if (m.t === 'clipmeta') { onClipMeta(m); return; }
   if (m.t === 'clipdata') { onClipData(m); return; }
@@ -475,6 +547,8 @@ function stopWatching() {
   stopDownload(false);
   clipList = [];
   renderClips();
+  learnLive = false;
+  syncLearn();
   renderOps();
   showMsg('「見る」を押すと、カメラ側の映像を探します');
 }

@@ -165,6 +165,16 @@
   .clips video { display: block; width: 100%; max-height: 50vh; margin-top: 8px; border-radius: 10px; background: #000; }
   .rec-on { color: var(--danger); }
 
+  /* 猫の学習 */
+  .btn.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+  .learn-counts { font-weight: 600; margin: 0 0 8px; }
+  .learn-grid { list-style: none; margin: 10px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; }
+  .learn-tile { min-width: 0; }
+  .learn-tile img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 10px; background: #000; }
+  .learn-cap { font-size: .78rem; color: var(--muted); margin: 4px 0; }
+  .learn-btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .learn-btns .btn { padding: 6px 4px; }
+
   .dim {
     position: fixed; inset: 0; z-index: 10; background: #000;
     display: flex; align-items: center; justify-content: center; touch-action: manipulation;
@@ -233,6 +243,12 @@
       <ul id="vClips" class="clips"></ul>
       <p class="help">「見る」を押すと、カメラ側から録画を受け取って再生します。1分で約7MBです。中継サーバー経由のときは、データ通信量を使います。</p>
     </section>
+
+    <details class="card" id="vLearnBox">
+      <summary>猫の学習</summary>
+      <p class="help" style="margin-top:0">カメラ側が「猫かも」と思った写真に、「🐱 猫」か「✕ ちがう」を教えます。教えるほど、カメラ側がまちがえにくくなります（写真と答えはカメラ側のiPhoneに保存されます）。</p>
+      <div id="vLearnPanel"></div>
+    </details>
 
     <details class="card" id="vSettings">
       <summary>設定</summary>
@@ -304,17 +320,15 @@
       <p class="help">通知を受けるiPhone（A）のntfyアプリで、この名前を購読してください。「共有」を押すと、見る側（A）の招待リンクを送れます（AirDropなど）。名前を知っている人は通知や映像を見られるので、他人には教えないでください。</p>
     </div>
 
-    <fieldset class="field">
-      <legend>見つける対象</legend>
-      <label class="check"><input type="checkbox" name="target" value="animal"> 動物（ぜんぶ）</label>
-      <label class="check"><input type="checkbox" name="target" value="person"> 人</label>
-      <p class="help">動物は、猫・犬・鳥・馬・羊・牛・象・クマ・シマウマ・キリンです。タヌキなどは、猫や犬と見まちがえて見つけることがあります。「人」を選ぶときは、通行人や隣の家が映らない向きに置いてください。</p>
-    </fieldset>
+    <div class="field">
+      <span class="label">見つける対象：猫だけ</span>
+      <p class="help">AIは2段階で見ます。1段目で「動物かも」という場所を見つけ、2段目でその部分を切り出して「猫かどうか」をもう一度確かめます。犬や鳥は通知しません。下の「猫の学習」で写真に答えを教えると、このカメラの景色に合わせて、もっとまちがえにくくなります。</p>
+    </div>
 
     <div class="field">
       <label for="threshold">判定の厳しさ：<span id="thresholdVal"></span></label>
       <input id="threshold" type="range" min="0.3" max="0.9" step="0.05">
-      <p class="help">上げると間違いの通知が減り、見逃しが増えます。映像の枠に出る数字（%）を見ながら調整してください。</p>
+      <p class="help">枠に出る「猫 ◯%」がこの数字以上になると通知します。上げると間違いの通知が減り、見逃しが増えます。</p>
     </div>
 
     <div class="field grid2">
@@ -437,6 +451,13 @@
     <div class="row"><button id="clipsClear" class="btn small" hidden>すべて削除</button></div>
   </section>
 
+  <details class="card" id="learnBox">
+    <summary>猫の学習</summary>
+    <p class="help" style="margin-top:0">カメラが「猫かも」と思った写真が、ここにたまります。写真ごとに「🐱 猫」か「✕ ちがう」を押して教えると、次からは似た写真を見たときに、その答えを使って判断します。猫も、猫じゃないもの（植木・影・鳥など）も、たくさん教えるほど、まちがいが減ります。見る側（A）からも教えられます。</p>
+    <div id="learnPanel"></div>
+    <div class="row"><button id="learnReset" class="btn small">覚えたことを全部消す</button></div>
+  </details>
+
   <details class="card">
     <summary>使い方</summary>
     <ol class="help-list">
@@ -447,6 +468,7 @@
       <li>「省電力表示」で画面を黒くできます（すばやく2回タップで戻ります）。</li>
       <li>見つけている間は自動で録画し、「録画」欄に保存します（このiPhoneの中だけ）。「保存・共有」から写真アプリへの保存やAirDropができます。</li>
       <li>設定の「共有」で、見る側（A）の招待リンクを送れます。Aで開いて「見る」を押すと、このiPhoneの映像を見られます。Aからは、カメラ切替・ライト・低光量モードを操作できます。</li>
+      <li>「猫の学習」に、カメラが「猫かも」と思った写真がたまります。ときどき開いて「🐱 猫」「✕ ちがう」を教えると、このカメラの景色に合わせて、まちがえにくくなります（見る側からも教えられます）。</li>
       <li>通知は1回来るたびに1回です。「判定」欄が「いない」に戻ってから再び現れると、また通知します。</li>
     </ol>
   </details>
