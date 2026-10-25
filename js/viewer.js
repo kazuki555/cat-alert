@@ -6,7 +6,7 @@ setLogElement($('#vLog'));
 
 const els = {
   video: $('#vVideo'), msg: $('#vMsg'), stage: $('#vStage'),
-  watch: $('#vWatch'), stop: $('#vStop'), full: $('#vFull'),
+  watch: $('#vWatch'), stop: $('#vStop'), full: $('#vFull'), fullExit: $('#vFullExit'),
   link: $('#vLink'), kind: $('#vKind'), cam: $('#vCam'), wake: $('#vWake'),
   topic: $('#vTopic'), settings: $('#vSettings'),
   banner: $('#vBanner'), overlay: $('#vOverlay'),
@@ -483,15 +483,37 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // ---------- 全画面 ----------
-els.full.addEventListener('click', () => {
-  const v = els.video;
+// iPhone の動画プレーヤーの全画面（webkitEnterFullscreen）は、低光量モードの明るさ補正（filter）と枠が消えるので使わない。
+// ページの中で映像を画面いっぱいに広げる。ブラウザが要素の全画面に対応していれば（パソコン・iPad）、それも使う
+const fsElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
+function setFull(on) {
+  els.stage.classList.toggle('full', on);
+  document.body.classList.toggle('no-scroll', on);
+  els.fullExit.hidden = !on;
+  requestAnimationFrame(drawDets);
+}
+function enterFull() {
+  setFull(true);
+  const st = els.stage;
   try {
-    if (els.stage.requestFullscreen) els.stage.requestFullscreen();
-    else if (v.webkitEnterFullscreen) v.webkitEnterFullscreen();  // iPhone の Safari
-  } catch (e) {
-    addLog(`全画面にできませんでした（${errText(e)}）`, 'warn');
-  }
-});
+    const req = st.requestFullscreen || st.webkitRequestFullscreen;
+    const p = req && (document.fullscreenEnabled || document.webkitFullscreenEnabled) ? req.call(st) : null;
+    p?.catch?.(() => { /* できなくても、ページの中の全画面で見られる */ });
+  } catch { /* ページの中の全画面で見られる */ }
+}
+function exitFull() {
+  setFull(false);
+  try {
+    if (fsElement()) (document.exitFullscreen || document.webkitExitFullscreen).call(document)?.catch?.(() => {});
+  } catch { /* すでに戻っている */ }
+}
+els.full.addEventListener('click', enterFull);
+els.fullExit.addEventListener('click', exitFull);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && els.stage.classList.contains('full')) exitFull(); });
+// ブラウザの全画面を Esc などで抜けたら、こちらも戻す
+for (const ev of ['fullscreenchange', 'webkitfullscreenchange']) {
+  document.addEventListener(ev, () => { if (!fsElement() && els.stage.classList.contains('full')) setFull(false); else drawDets(); });
+}
 
 // ---------- 合言葉 ----------
 els.topic.value = topic;
